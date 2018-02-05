@@ -480,11 +480,14 @@ static void cpufreq_interactive_timer(unsigned long data)
 	bool jump_to_max_no_ts = false;
 	bool jump_to_max = false;
 	bool start_hyst = true;
+    unsigned int this_hispeed_freq;
 
 	if (!down_read_trylock(&ppol->enable_sem))
 		return;
 	if (!ppol->governor_enabled)
 		goto exit;
+	if (ppol->policy->min == ppol->policy->max)
+		goto rearm;
 
 	now = ktime_to_us(ktime_get());
 
@@ -555,6 +558,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	spin_unlock(&ppol->load_lock);
 
 	tunables->boosted = tunables->boost_val || now < tunables->boostpulse_endtime;
+        this_hispeed_freq = max(tunables->hispeed_freq, ppol->policy->min);
 
 	prev_chfreq = choose_freq(ppol, prev_laf);
 	pred_chfreq = choose_freq(ppol, pred_laf);
@@ -575,29 +579,29 @@ static void cpufreq_interactive_timer(unsigned long data)
 	}
 
 	new_freq = chosen_freq;
-	if (jump_to_max_no_ts || jump_to_max) {
+	if (false && (jump_to_max_no_ts || jump_to_max)) {
 		new_freq = ppol->policy->cpuinfo.max_freq;
 	} else if (!skip_hispeed_logic) {
 		if (pol_load >= tunables->go_hispeed_load ||
 		    tunables->boosted) {
-			if (ppol->target_freq < tunables->hispeed_freq)
-				new_freq = tunables->hispeed_freq;
+			if (ppol->target_freq < this_hispeed_freq)
+				new_freq = this_hispeed_freq;
 			else
 				new_freq = max(new_freq,
-					       tunables->hispeed_freq);
+					       this_hispeed_freq);
 		}
 	}
 
 	if (now - ppol->max_freq_hyst_start_time <
 	    tunables->max_freq_hysteresis) {
 		if (new_freq < ppol->policy->max &&
-				ppol->policy->max <= tunables->hispeed_freq)
+				ppol->policy->max <= this_hispeed_freq)
 			start_hyst = false;
-		new_freq = max(tunables->hispeed_freq, new_freq);
+		new_freq = max(this_hispeed_freq, new_freq);
 	}
 
 	if (!skip_hispeed_logic &&
-	    ppol->target_freq >= tunables->hispeed_freq &&
+	    ppol->target_freq >= this_hispeed_freq &&
 	    new_freq > ppol->target_freq &&
 	    now - ppol->hispeed_validate_time <
 	    freq_to_above_hispeed_delay(tunables, ppol->target_freq)) {
@@ -645,7 +649,7 @@ static void cpufreq_interactive_timer(unsigned long data)
 	 * min_sample_time.
 	 */
 
-	if ((!tunables->boosted || new_freq > tunables->hispeed_freq)
+	if ((!tunables->boosted || new_freq > this_hispeed_freq)
 	    && !jump_to_max_no_ts) {
 		ppol->floor_freq = new_freq;
 		ppol->floor_validate_time = now;
@@ -997,13 +1001,22 @@ static ssize_t store_above_hispeed_delay(
 	struct cpufreq_interactive_tunables *tunables,
 	const char *buf, size_t count)
 {
-	int ntokens;
+	int ntokens, i;
 	unsigned int *new_above_hispeed_delay = NULL;
 	unsigned long flags;
 
 	new_above_hispeed_delay = get_tokenized_data(buf, &ntokens);
 	if (IS_ERR(new_above_hispeed_delay))
 		return PTR_RET(new_above_hispeed_delay);
+
+	/* Make sure frequencies are in ascending order. */
+	for (i = 3; i < ntokens; i += 2) {
+		if (new_above_hispeed_delay[i] <=
+		    new_above_hispeed_delay[i - 2]) {
+			kfree(new_above_hispeed_delay);
+			return -EINVAL;
+		}
+	}
 
 	spin_lock_irqsave(&tunables->above_hispeed_delay_lock, flags);
 	if (tunables->above_hispeed_delay != default_above_hispeed_delay)
@@ -1656,6 +1669,7 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 	struct cpufreq_interactive_policyinfo *ppol;
 	struct cpufreq_frequency_table *freq_table;
 	struct cpufreq_interactive_tunables *tunables;
+        unsigned int anyboost;
 
 	if (have_governor_per_policy())
 		tunables = policy->governor_data;
@@ -1747,8 +1761,6 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 		mutex_lock(&gov_lock);
 
 		freq_table = cpufreq_frequency_get_table(policy->cpu);
-		if (!tunables->hispeed_freq)
-			tunables->hispeed_freq = policy->max;
 
 		ppol = per_cpu(polinfo, policy->cpu);
 		ppol->policy = policy;
@@ -1804,8 +1816,17 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 				cpufreq_interactive_timer_resched(policy->cpu,
 								  true);
 			ppol->min_freq = policy->min;
+                        anyboost = 1;
 		}
 		up_read(&ppol->enable_sem);
+
+		if (anyboost) {
+			u64 now = ktime_to_us(ktime_get());
+
+			ppol->hispeed_validate_time = now;
+			ppol->floor_freq = policy->min;
+			ppol->floor_validate_time = now;
+		}
 
 		break;
 	}
